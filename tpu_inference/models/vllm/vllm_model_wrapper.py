@@ -302,25 +302,25 @@ class VllmModelWrapper:
     def build_pooler_func(self) -> PoolerFunc:
 
         def compute_pooler_output(
-            hidden_states: jax.Array,
+            jax_hidden_states: jax.Array,
             pooling_metadata: PoolingMetadata,
             seq_lens: np.ndarray,
         ) -> PoolerOutput:
             assert self._pooler is not None, "Model does not support pooling"
 
-            torch_hidden_state: torch.Tensor = torch_view(hidden_states)
+            hidden_state: torch.Tensor = torch_view(jax_hidden_states)
             with torchax.default_env():
+                hidden_state = hidden_state.to('cpu', non_blocking=True)
                 pooling_metadata.build_pooling_cursor(
                     seq_lens,
                     torch.tensor(seq_lens),
-                    device=torch_hidden_state.device,
+                    device=hidden_state.device,
                 )
                 outputs: list[torch.Tensor] = self._pooler(
-                    torch_hidden_state,
+                    hidden_state,
                     pooling_metadata,
                 )
-                results = [t.to('cpu', non_blocking=True) for t in outputs]
-                return results
+                return outputs
 
         return compute_pooler_output
 
