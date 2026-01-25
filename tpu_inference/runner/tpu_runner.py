@@ -800,15 +800,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 return attn_metadata, hidden_states
 
             if self.is_pooling_model:
-                seq_lens = self.seq_lens_cpu[:self.input_batch.num_reqs]
                 pooling_metadata = self.input_batch.get_pooling_metadata()
 
                 pooler_fn: PoolerFunc = self.pooler_fn
                 pooler_output = pooler_fn(
                     hidden_states,
                     pooling_metadata,
-                    seq_lens,
+                    self.seq_lens_cpu,
                 )
+                pooler_output = pooler_output[:self.input_batch.num_reqs]
 
                 return None, ModelRunnerOutput(
                     req_ids=self.input_batch.req_ids,

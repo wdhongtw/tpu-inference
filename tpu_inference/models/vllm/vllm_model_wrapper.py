@@ -310,7 +310,6 @@ class VllmModelWrapper:
 
             hidden_state: torch.Tensor = torch_view(jax_hidden_states)
             with torchax.default_env():
-                hidden_state = hidden_state.to('cpu', non_blocking=True)
                 pooling_metadata.build_pooling_cursor(
                     seq_lens,
                     torch.tensor(seq_lens),
@@ -320,7 +319,8 @@ class VllmModelWrapper:
                     hidden_state,
                     pooling_metadata,
                 )
-                return outputs
+                results = [e.to('cpu') for e in outputs]
+                return results
 
         return compute_pooler_output
 
