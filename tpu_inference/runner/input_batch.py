@@ -160,8 +160,7 @@ class InputBatch:
         # As embedding task for converted model is not implemented yet,
         # so it's ok to set prompt token ID list to None here.
         return PoolingMetadata(
-            prompt_lens=torch.from_numpy(
-                self.num_prompt_tokens[:self.num_reqs]),
+            prompt_lens=torch.from_numpy(self.num_prompt_tokens),
             prompt_token_ids=None,
             pooling_params=pooling_params,
             pooling_states=pooling_states,

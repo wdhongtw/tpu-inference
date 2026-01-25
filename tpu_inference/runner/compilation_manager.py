@@ -31,7 +31,7 @@ from tpu_inference.layers.jax.sample.sampling_metadata import \
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
-from tpu_inference.utils import device_array
+from tpu_inference.utils import device_array, to_jax_dtype
 
 if TYPE_CHECKING:
     from tpu_inference.runner.tpu_runner import TPUModelRunner
@@ -500,6 +500,41 @@ class CompilationManager:
         # It's quite hard, if not impossible, to move all tensor to accelerator
         # and apply JIT on the entire computation.
         # See PoolingCursor and AllPool, MeanPool ... in vLLM repo for details.
+
+        hidden_size = self.runner.model_config.get_hidden_size()
+        dtype = to_jax_dtype(self.runner.model_config.dtype)
+        put = jax.device_put
+        cases = [(s, t) for s in self.runner.num_reqs_paddings
+                 for t in self.runner.num_tokens_paddings]
+        sharding = NamedSharding(self.runner.mesh, PartitionSpec())
+        sharding_none = NamedSharding(self.runner.mesh, PartitionSpec(None))
+        for num_seq, num_token in cases:
+            hidden_state = jnp.ones((num_token, hidden_size), dtype=dtype)
+            hidden_state = put(hidden_state, sharding)
+            query_start_loc = jnp.arange(num_seq + 1, dtype=jnp.int32)
+            query_start_loc = put(query_start_loc, sharding_none)
+            num_tokens = jnp.ones((num_seq, ), dtype=jnp.int32)
+            num_tokens = put(num_tokens, sharding_none)
+            self._run_compilation(
+                f"worker{self.runner.rank} pooler_fn",
+                self.runner.pooler_fn,
+                hidden_state,
+                query_start_loc,
+                num_tokens,
+                num_seq,
+            )
+
+        import torch
+        import torchax
+        from torchax.interop import torch_view
+        for num_seq in self.runner.num_reqs_paddings:
+            # MeanPooler using float32
+            hidden_state = jnp.ones((num_seq, hidden_size), dtype=jnp.float32)
+            hidden_state = put(hidden_state, sharding)
+            pooler_out: torch.Tensor = torch_view(hidden_state)
+            with torchax.default_env():
+                raw_pooler_output = pooler_out.to('cpu')
+                _ = [raw_pooler_output[i] for i in range(num_seq)]
 
     def _precompile_sampling(self) -> None:
         logger.info("Compiling sampling with different input shapes.")
