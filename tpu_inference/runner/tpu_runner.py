@@ -64,7 +64,6 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.models.jax.utils.weight_utils import (
     shard_put, transfer_state_with_mappings)
-from tpu_inference.models.vllm.vllm_model_wrapper import PoolerFunc
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.compilation_manager import CompilationManager
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
@@ -88,6 +87,33 @@ logging.getLogger("torchax.tensor").setLevel(logging.ERROR)
 INVALID_TOKEN_ID = -1
 # Smallest output size
 MIN_NUM_SEQS = 8
+
+class AsyncTPUModelRunnerPoolingOutput(AsyncModelRunnerOutput):
+    def __init__(
+        self,
+        model_runner_output: ModelRunnerOutput,
+        num_reqs: int,
+        pooler_output: jax.Array,
+    ):
+        self._model_runner_output = model_runner_output
+        self._num_reqs = num_reqs
+        self._pooler_output = pooler_output
+
+    def get_output(self) -> ModelRunnerOutput:
+        import torch
+        import torchax
+        from torchax.interop import torch_view
+        with torchax.default_env():
+
+            pooler_output: torch.Tensor = torch_view(self._pooler_output)
+            with torchax.default_env():
+                raw_pooler_output = pooler_output.to('cpu', non_blocking=True)
+            pooler_output = [
+                raw_pooler_output[i] for i in range(self._num_reqs)
+            ]
+
+        self._model_runner_output.pooler_output = pooler_output
+        return self._model_runner_output
 
 
 class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
@@ -791,24 +817,33 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 return hidden_states
 
             if self.is_pooling_model:
-                seq_lens = self.seq_lens_cpu[:self.input_batch.num_reqs]
-                pooling_metadata = self.input_batch.get_pooling_metadata()
+                from typing import cast
 
-                pooler_fn: PoolerFunc = self.pooler_fn
-                pooler_output = pooler_fn(
+                metadata = cast(AttentionMetadata, attn_metadata)
+                pooler_fn = self.pooler_fn
+
+                raw_pooler_output: jax.Array = pooler_fn(
                     hidden_states,
-                    pooling_metadata,
-                    seq_lens,
+                    metadata.query_start_loc,
+                    metadata.seq_lens,
+                    self.input_batch.num_reqs,
                 )
 
-                return ModelRunnerOutput(
+                output = ModelRunnerOutput(
                     req_ids=self.input_batch.req_ids,
-                    req_id_to_index=self.input_batch.req_id_to_index,
+                    req_id_to_index=copy.deepcopy(
+                        self.input_batch.req_id_to_index),
                     sampled_token_ids=[],
                     logprobs=None,
                     prompt_logprobs_dict={},
-                    pooler_output=pooler_output,
+                    pooler_output=None,
                 )
+                result = AsyncTPUModelRunnerPoolingOutput(
+                    model_runner_output=output,
+                    pooler_output=raw_pooler_output,
+                    num_reqs=self.input_batch.num_reqs,
+                )
+                return result
 
             hidden_states = self._select_from_array_fn(hidden_states,
                                                        logits_indices)
