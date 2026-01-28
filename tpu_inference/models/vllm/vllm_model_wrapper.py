@@ -310,27 +310,45 @@ class VllmModelWrapper:
         return compute_logits_func
 
     def build_pooler_func(self) -> PoolerFunc:
+        # N: number of requests
+        # T: number of tokens
+        # H: hidden dimension
 
+        @jax.jit
         def compute_pooler_output(
-            hidden_states: jax.Array,
-            pooling_metadata: PoolingMetadata,
-            seq_lens: np.ndarray,
-        ) -> PoolerOutput:
-            assert self._pooler is not None, "Model does not support pooling"
+                hidden_state: jax.Array,
+                query_start_loc: jax.Array,  # [N + 1]
+                num_tokens: jax.Array,  # [N]
+                seq_num: jax.Array,  # [()]
+        ) -> jax.Array:
+            # ====== DispatchPooler > SequencePooler > MeanPool =====
+            # hidden_state [T, H], token length, hidden dimension
+            import jax.numpy as jnp
+            from torchax.interop import jax_view
 
-            torch_states: torch.Tensor = torch_view(hidden_states)
+            # add dummy token at the end
+            hidden_state = jnp.pad(hidden_state, ((0, 1), (0, 0)))
+            # now [T + 1, H]
+
+            cum_sum = jnp.cumsum(hidden_state, axis=0, dtype=jnp.float32)
+            start_indices = query_start_loc[:-1]  # N
+            end_indices = query_start_loc[1:] - 1  # N
+            per_req_sum = cum_sum[end_indices] - cum_sum[
+                start_indices] + hidden_state[start_indices]  # N, H
+            # mask num_tokens with first seq_num (scalar) values from num_tokens and remain part from jnp.ones
+            mask = jnp.arange(num_tokens.shape[0])
+            num_tokens = jnp.where(mask < seq_num, num_tokens,
+                                   jnp.ones_like(num_tokens))  # (N)
+
+            mean = per_req_sum / jnp.expand_dims(num_tokens,
+                                                 axis=-1)  # (N, H) / (N, 1)
+
+            # ====== DispatchPooler > SequencePooler > EmbeddingPoolerHead > PoolerNormalize =====
+            activator = self._pooler.poolers_by_task['embed'].head.activation
             with torchax.default_env():
-                torch_states = torch_states.to('cpu', non_blocking=True)
-                pooling_metadata.build_pooling_cursor(
-                    seq_lens,
-                    torch.tensor(seq_lens),
-                    device=torch_states.device,
-                )
-                outputs: list[torch.Tensor] = self._pooler(
-                    torch_states,
-                    pooling_metadata,
-                )
-                return outputs
+                activated = activator(torch_view(mean))
+                result: jax.Array = jax_view(activated)
+            return result
 
         return compute_pooler_output
 
