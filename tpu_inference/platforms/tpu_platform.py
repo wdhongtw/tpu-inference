@@ -7,6 +7,7 @@ import torch
 import vllm.envs as vllm_envs
 from tpu_info import device
 from vllm.platforms.interface import Platform, PlatformEnum
+from vllm.v1.attention.backend import AttentionType
 
 from tpu_inference import envs
 from tpu_inference.layers.common.sharding import ShardingConfigManager
@@ -60,7 +61,14 @@ class TpuPlatform(Platform):
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         # Invoke @register_backend in the module.
-        import tpu_inference.layers.vllm.attention  # noqa: F401
+        match attn_selector_config.attn_type:
+            case AttentionType.DECODER:
+                import tpu_inference.layers.vllm.attention  # noqa: F401
+            case AttentionType.ENCODER_ONLY:
+                import tpu_inference.layers.vllm.attention_jax  # noqa: F401
+            case _ as attn_type:
+                raise ValueError(f"Unsupported: {attn_type}")
+
         if selected_backend != AttentionBackendEnum.FLASH_ATTN:
             logger.info("Cannot use %s backend on TPU. Setting to FLASH_ATTN.",
                         selected_backend)
