@@ -29,6 +29,7 @@ from jax.sharding import PartitionSpec as P
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel as rpa
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from tpu_inference.kernels.flash_attention.kernel import flash_attention
+from tpu_inference.kernels.flash_attention.kernel import BlockSizes
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_megacore
@@ -49,6 +50,8 @@ def sharded_flash_attention(
     causal: bool = True,
     sm_scale: Optional[float] = None,
     vmem_limit_bytes: int | None = None,
+    *,
+    block_sizes: BlockSizes | None = None,
 ) -> Callable[..., Any]:
     in_specs = (
         P("data", "model", None, None),  # q
@@ -64,6 +67,7 @@ def sharded_flash_attention(
                                v,
                                segment_ids=segment_ids,
                                sm_scale=sm_scale,
+                               block_sizes=block_sizes,
                                causal=causal,
                                vmem_limit_bytes=vmem_limit_bytes)
 
