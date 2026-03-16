@@ -20,6 +20,7 @@ from typing import Any, List, Optional, Tuple
 from unittest.mock import patch
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.nn
@@ -74,6 +75,12 @@ class _VllmRunner(torch.nn.Module):
     def forward(self, **kwargs) -> torch.Tensor:
         if "hidden_state" in kwargs:
             return self.compute_logits(kwargs["hidden_state"])
+        elif "call_method" in kwargs:
+            method_name = kwargs["call_method"]
+            call_args = kwargs.get("call_args", tuple())
+            call_kwargs = kwargs.get("call_kwargs", {})
+            method = getattr(self.vllm_model, method_name)
+            return method(*call_args, **call_kwargs)
         else:
             return self.compute_hidden_state(
                 kwargs["input_ids"],
@@ -112,9 +119,70 @@ class VllmModelWrapper:
         self.vllm_config.quant_config = get_tpu_quantization_config(
             self.vllm_config, self.mesh)
         self._apply_pp_patch()
-
+        self._patch_sdpa()
         MultiHeadLatentAttentionWrapper.register_oot(
             VllmTPUMultiHeadLatentAttentionWrapper)
+
+    def _patch_sdpa(self):
+        from torchax.ops.jtorch import register_function
+        from tpu_inference.layers.common.attention_interface import sharded_flash_attention
+        from tpu_inference.kernels.flash_attention.kernel import SegmentIds
+        import math
+
+        @register_function(
+            torch.nn.functional.scaled_dot_product_attention,
+            is_jax_function=True,
+            needs_env=False,
+        )
+        @register_function(
+            torch.ops.aten.scaled_dot_product_attention,
+            is_jax_function=True,
+            needs_env=False,
+        )
+        def patched_sdpa(
+            query,
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=None,
+            enable_gqa=False,
+        ):
+            # Q, K, V shapes: (batch, num_heads, seq_len, head_dim)            
+            q_seq_len = query.shape[2]
+            kv_seq_len = key.shape[2]
+            
+            q_pad = (128 - (q_seq_len % 128)) % 128
+            kv_pad = (128 - (kv_seq_len % 128)) % 128
+            
+            if q_pad > 0:
+                query = jnp.pad(query, ((0, 0), (0, 0), (0, q_pad), (0, 0)))
+            if kv_pad > 0:
+                key = jnp.pad(key, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
+                value = jnp.pad(value, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
+            
+            batch = query.shape[0]
+            
+            # segment_ids should be a SegmentIds object, 1 for real, 0 for padded
+            q_seg = jnp.ones((batch, q_seq_len), dtype=jnp.int32)
+            if q_pad > 0:
+                q_seg = jnp.pad(q_seg, ((0, 0), (0, q_pad)))
+                
+            kv_seg = jnp.ones((batch, kv_seq_len), dtype=jnp.int32)
+            if kv_pad > 0:
+                kv_seg = jnp.pad(kv_seg, ((0, 0), (0, kv_pad)))
+                
+            segment_ids = SegmentIds(q=q_seg, kv=kv_seg)
+            
+            # flash_attention signature: q, k, v, segment_ids
+            attn_fn = sharded_flash_attention(self.mesh, causal=False, sm_scale=scale)
+            out = attn_fn(query, key, value, segment_ids)
+            
+            if q_pad > 0:
+                out = out[:, :, :q_seq_len, :]
+                
+            return out
 
     def _apply_pp_patch(self):
         # patch `get_pp_group` in vLLM to jax's get_pp_group.
@@ -269,7 +337,7 @@ class VllmModelWrapper:
                         "input_ids": torch_view(input_ids),
                         "positions": torch_view(input_positions),
                         "intermediate_tensors": intermediate_tensors,
-                        "inputs_embeds": None,
+                        "inputs_embeds": torch_view(input_embeds),
                     },
                     tie_weights=False,
                 )
@@ -286,6 +354,91 @@ class VllmModelWrapper:
             return new_kv_caches, output, []
 
         return step_fun
+
+    def jit_embed_multimodal_func(self):
+        if not hasattr(self.model.vllm_model, "embed_multimodal"):
+            return None
+
+        def embed_multimodal_func(
+            params_and_buffers: Any,
+            image_grid_thw: Any,
+            **kwargs,
+        ) -> Any:
+            # TODO: Args for jax path. Need to refactor the function call.
+            del image_grid_thw
+            with torchax.default_env():
+                call_kwargs = {}
+                for k, v in kwargs.items():
+                    if isinstance(v, jax.Array):
+                        call_kwargs[k] = torch_view(v)
+                    elif isinstance(v, np.ndarray):
+                        # The "pixel_values" of some models may validate it as
+                        # a torch.Tensor. Cast it back to torch.Tensor.
+                        # TODO: pass kwargs as jax.array if needed
+                        call_kwargs[k] = torch_view(jnp.array(v))
+                    elif isinstance(v, torch.Tensor):
+                        call_kwargs[k] = v
+                    else:
+                        call_kwargs[k] = v
+                
+                output_from_torch = torch.func.functional_call(
+                    self.model,
+                    torch_view(params_and_buffers),
+                    kwargs={
+                        "call_method": "embed_multimodal",
+                        "call_args": (),
+                        "call_kwargs": call_kwargs,
+                    },
+                    tie_weights=False,
+                )
+                
+                if isinstance(output_from_torch, (tuple, list)):
+                    return [jax_view(v) if isinstance(v, torch.Tensor) else v for v in output_from_torch]
+                return jax_view(output_from_torch)
+        return embed_multimodal_func
+
+    def jit_embed_input_ids_func(self):
+        if not hasattr(self.model.vllm_model, "embed_input_ids"):
+            return None
+
+        embed_sharding = NamedSharding(self.mesh, PartitionSpec(None))
+
+        ### YYY: TRY fix jit
+        # @jax.jit(out_shardings=(embed_sharding))
+        def embed_input_ids_func(
+            params_and_buffers: Any,
+            input_ids: jax.Array,
+            mm_embeds: list[jax.Array] | jax.Array | None = None,
+            *,
+            is_multimodal: jax.Array | None = None,
+            handle_oov_mm_token: bool = False,
+        ) -> jax.Array:
+            with torchax.default_env():
+                if mm_embeds is not None:
+                    if isinstance(mm_embeds, list):
+                        torch_mm_embeds = [torch_view(x) for x in mm_embeds]
+                    else:
+                        torch_mm_embeds = torch_view(mm_embeds)
+                    call_args = (torch_view(input_ids), torch_mm_embeds)
+                else:
+                    call_args = (torch_view(input_ids), )
+
+                output_from_torch = torch.func.functional_call(
+                    self.model,
+                    torch_view(params_and_buffers),
+                    kwargs={
+                        "call_method": "embed_input_ids",
+                        "call_args": call_args,
+                        "call_kwargs": {
+                            "is_multimodal": torch_view(is_multimodal),
+                            "handle_oov_mm_token": handle_oov_mm_token,
+                        },
+                    },
+                    tie_weights=False,
+                )
+                
+                return jax_view(output_from_torch)
+        return embed_input_ids_func
 
     def jit_compute_logits_func(self):
 
