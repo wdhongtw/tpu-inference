@@ -335,6 +335,7 @@ def sharded_ragged_paged_attention(
     distribution: jax.Array,
     attention_sink: jax.Array | None,
     sm_scale: float,
+    use_causal: bool,
     attention_chunk_size: int | None = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
@@ -374,7 +375,8 @@ def sharded_ragged_paged_attention(
     args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
 
     use_hd64 = q.shape[-1] == 64
-    func = ragged_paged_attention_hd64 if use_hd64 else ragged_paged_attention
+    # func = ragged_paged_attention_hd64 if use_hd64 else ragged_paged_attention
+    func = ragged_paged_attention
 
     if attention_sink is not None:
         if not use_hd64:
@@ -392,6 +394,7 @@ def sharded_ragged_paged_attention(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            use_causal_mask=use_causal,
         )
 
     return jax.shard_map(
@@ -410,6 +413,7 @@ def attention(
     v: jax.Array,
     attention_metadata: AttentionMetadata,
     mesh: Mesh,
+    use_causal: bool,
     head_dim_original: int | None = None,  # before padding,
     sm_scale: float | None = None,
     attention_chunk_size: int | None = None,
@@ -451,6 +455,7 @@ def attention(
         md.request_distribution,
         sinks,
         sm_scale=sm_scale,
+        use_causal=use_causal,
         attention_chunk_size=attention_chunk_size,
         q_scale=q_scale,
         k_scale=k_scale,

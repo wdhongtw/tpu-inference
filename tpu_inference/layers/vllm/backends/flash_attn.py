@@ -40,6 +40,12 @@ class PallasAttentionBackend(AttentionBackend):
     def get_impl_cls() -> type["PallasAttentionBackendImpl"]:
         return PallasAttentionBackendImpl
 
+    # This method is required for pooling task.
+    # Return a dummy class. We don't need builder for attn metadata for TPU
+    @staticmethod
+    def get_builder_cls():  # -> Type["AttentionMetadataBuilder"]:
+        return object
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
@@ -130,7 +136,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if kv_cache_dtype != "auto":
             self.kv_cache_quantized_dtype = utils.to_jax_dtype(kv_cache_dtype)
 
-        if attn_type != AttentionType.DECODER:
+        self._use_causal: bool
+        if attn_type == AttentionType.DECODER:
+            self._use_causal = True
+        elif attn_type == AttentionType.ENCODER_ONLY:
+            self._use_causal = False
+        else:
             raise NotImplementedError("Encoder self-attention and "
                                       "encoder/decoder cross-attention "
                                       "are not implemented for "
@@ -173,9 +184,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
         del kv_cache  # Use kv_cache from vllm wrapper context values instead.
 
         vllm_model_wrapper_context = get_vllm_model_wrapper_context()
-        kv_cache_index = vllm_model_wrapper_context.layer_name_to_kvcache_index[
-            layer.layer_name]
-        kv_cache = vllm_model_wrapper_context.kv_caches[kv_cache_index]
+        if self._use_causal:
+            kv_cache_index = vllm_model_wrapper_context.layer_name_to_kvcache_index[
+                layer.layer_name]
+            kv_cache = vllm_model_wrapper_context.kv_caches[kv_cache_index]
+        else:
+            from tpu_inference.kernels.ragged_paged_attention.v3.kernel import \
+                get_kv_cache_shape as get_kv_cache_shape
+            kv_cache_shape = get_kv_cache_shape(
+                0,
+                0,
+                self.num_kv_heads,
+                self.head_size,
+                jnp.bfloat16,
+            )
+
+            kv_cache = jnp.zeros(kv_cache_shape, dtype=jnp.bfloat16)
 
         mesh = vllm_model_wrapper_context.mesh
 
@@ -204,6 +228,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.head_size,
             self.num_heads,
             self.num_kv_heads,
+            self._use_causal,
             q_scale,
             k_scale,
             v_scale,
@@ -221,6 +246,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         "head_size",
         "num_heads",
         "num_kv_heads",
+        "use_causal",
         "q_scale",
         "k_scale",
         "v_scale",
@@ -240,6 +266,7 @@ def _jax_attn_func(
     head_size: int,
     num_heads: int,
     num_kv_heads: int,
+    use_causal: bool,
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
@@ -262,6 +289,7 @@ def _jax_attn_func(
         attention_metadata,
         mesh,
         sm_scale=scale,
+        use_causal=use_causal,
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
