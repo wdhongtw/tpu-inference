@@ -431,6 +431,135 @@ class VllmModelWrapper:
         if not self.vllm_config.model_config.is_multimodal_model:
             return None
 
+        def move(v: torch.Tensor) -> torch.Tensor:
+            if not isinstance(v, torch.Tensor):
+                logger.warning(f"Expect torch.Tensor, got {type(v)}")
+                return v
+            return v.to(device="jax")
+
+        the_model = self.model.vllm_model
+        # vllm_config = self.vllm_config
+        # TODO: handle eager mode when bucket not matched.
+        # compilation_config = vllm_config.compilation_config
+        graph_config = the_model.get_encoder_cudagraph_config()
+
+        def padded_embed_multimoda_func(
+            params_and_buffers: Any,
+            **kwargs,
+        ) -> jax.Array:
+            from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
+
+            assert isinstance(self.model.vllm_model, SupportsEncoderCudaGraph)
+            # TODO: robust check outside
+
+            BUCKET = 4096
+            BATCH_SIZE = 8
+            FRAME_PER_BATCH = 128
+
+            def using(method: str):
+                def wrapped(*args, **kwargs):
+                    return torch.func.functional_call(
+                        self.model,
+                        torch_view(params_and_buffers),
+                        kwargs={
+                            "call_method": method,
+                            "call_args": args,
+                            "call_kwargs": kwargs,
+                        },
+                        tie_weights=False,
+                    )
+
+                return wrapped
+
+
+            with torchax.default_env(), enable_torch_wrap(False):
+
+                # Ensure all tensors are moved into accelerator so the
+                # computation with weights can work properly.
+                mm_kwargs = torch_view(kwargs)
+
+                modality = the_model.get_input_modality(mm_kwargs)
+                input_key = graph_config.input_key_by_modality[modality]
+
+                capture_inputs = using("prepare_encoder_cudagraph_capture_inputs")(
+                    BUCKET,
+                    BATCH_SIZE,
+                    FRAME_PER_BATCH,
+                    "jax",
+                    torch.bfloat16,
+                )
+                output_len_list = using("get_encoder_cudagraph_per_item_output_tokens")(
+                    mm_kwargs,
+                )
+                target_len = capture_inputs.mm_kwargs[input_key].shape[0]
+
+                input_tensor = mm_kwargs[input_key]
+                buffers: dict[str, torch.Tensor | None] = using(
+                    "prepare_encoder_cudagraph_replay_buffers"
+                )(
+                    mm_kwargs=mm_kwargs,
+                    max_batch_size=BATCH_SIZE,
+                    max_frames_per_batch=FRAME_PER_BATCH,
+                ).buffers
+                # TODO: assert all element in buffers have same len (dim 0) as input_tensor
+
+                def optionally_pad(v: torch.Tensor | None) -> torch.Tensor | None:
+                    if v is None:
+                        return None
+                    if v.ndim == 0:
+                        return v
+                    return torch.nn.functional.pad(v, (0, 0, 0, target_len - v.shape[0]))
+
+                padded_kwargs = {
+                    input_key: optionally_pad(input_tensor)
+                }
+                padded_buffers = {}
+                for key in graph_config.buffer_keys:
+                    value = buffers[key]
+                    if value is None:
+                        padded_buffers[key] = None
+                        continue
+                    if value.ndim == 0:
+                        padded_buffers[key] = value
+                        continue
+                    # TODO: proper handling
+                    # for other than cu_seqlens
+                    if value.ndim == 2:
+                        padded_buffers[key] = optionally_pad(value)
+                        continue
+                    # for cu_seqlens
+                    if value.ndim == 1:
+                        padded_buffers[key] = value
+                        continue
+                    assert False
+
+                padded_kwargs = jax.tree.map(move, padded_kwargs)
+                padded_buffers = jax.tree.map(move, padded_buffers)
+
+                encoder_cudagraph_forward = torchax.interop.jax_jit(
+                    using("encoder_cudagraph_forward"),
+                )
+                padded_output = encoder_cudagraph_forward(
+                    mm_kwargs=padded_kwargs,
+                    buffers=padded_buffers,
+                )
+
+                # # TODO: handle model hinted buckets, not just user provided
+                # user_budgets = compilation_config.encoder_cudagraph_token_budgets
+                # assert user_budgets
+                # assert BUCKET in user_budgets
+
+                outputs: list[torch.Tensor] = []
+                offset = 0
+                for n_tok in output_len_list:
+                    sliced = padded_output[offset : offset + n_tok]
+                    outputs.append(sliced)
+                    offset += n_tok
+
+                return jax_view(outputs)
+
+        return padded_embed_multimoda_func
+
         def embed_multimodal_func_jax(
             params_and_buffers: Any,
             **kwargs,
