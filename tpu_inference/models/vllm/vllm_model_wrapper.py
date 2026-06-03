@@ -184,7 +184,11 @@ class EncoderManger:
                 )
                 return token_budgets, max_batch_size
 
-        self.token_budgets, self.max_batch_size = build_budgets_and_batch()
+        token_budgets, max_batch_size = build_budgets_and_batch()
+        self.token_budgets = token_budgets
+        """Sorted (ascending) list of token budgets."""
+        self.max_batch_size = max_batch_size
+
 
         def build_max_frames() -> int:
             user_max_frames = comp_config.encoder_cudagraph_max_frames_per_batch
@@ -629,11 +633,11 @@ class VllmModelWrapper:
 
 
         def embed_multimodal_graph_forward(
-            jax_params_and_buffers: Mapping[str, jax.Array],
-            **mm_kwargs: dict[str, NestedTensors],
-        ) -> list[jax.Array] | jax.Array:
+            jax_params_and_buffers: dict[str, jax.Array],
+            mm_kwargs: dict[str, NestedTensors],
+            token_budget: int,
+        ) -> jax.Array:
             # The return type is similar to MultiModalEmbeddings but in JAX.
-            assert isinstance(self.model, SupportsEncoderCudaGraph)
             model = self.model
             
             # Duplication of EncoderCudaGraphManager._copy_padded_buffer
@@ -643,25 +647,6 @@ class VllmModelWrapper:
             ) -> None:
                 dst.zero_()
                 dst[: src.shape[0]].copy_(src)
-
-            def get_fit_val(values: list[int], value: int) -> int | None:
-                # assume the values are ascending sorted.
-                for v in values:
-                    if v >= value:
-                        return v
-                return None
-
-            item_specs = model.get_encoder_cudagraph_item_specs(mm_kwargs)
-            token_budget = get_fit_val(
-                manager.token_budgets,
-                sum(spec.output_tokens for spec in item_specs),
-            )
-            if token_budget is None:
-                # Fallback to SupportsMultiModal.embed_multimodal
-                return embed_multimodal_func_torch(
-                    jax_params_and_buffers,
-                    **mm_kwargs,
-                )
 
             with (
                     torchax.default_env(),
@@ -701,18 +686,104 @@ class VllmModelWrapper:
                     )
                     outputs = torch_view(jax_outputs)
 
-                with _timer("slicing"):
+                return jax_view(outputs)
+
+
+        def embed_multimodal_graph_forward_all(
+            jax_params_and_buffers: dict[str, jax.Array],
+            **mm_kwargs: dict[str, NestedTensors],
+        ) -> list[jax.Array]:
+            assert isinstance(self.model, SupportsEncoderCudaGraph)
+            model = self.model
+
+            def get_fit_val(values: list[int], value: int) -> int | None:
+                # assume the values are ascending sorted.
+                for v in values:
+                    if v >= value:
+                        return v
+                return None
+
+            item_specs = model.get_encoder_cudagraph_item_specs(mm_kwargs)
+            num_items = len(item_specs)
+            out_tokens = [spec.output_tokens for spec in item_specs]
+
+            # batches is a list of (expected budget, list of item ID)"""
+            batches: list[tuple[int | None, list[int]]] = []
+            sorted_indices = sorted(range(num_items), key=lambda i: out_tokens[i])
+
+            # Greedy packing into batches.
+            idx = 0
+            while idx < num_items:
+                indexes: list[int] = []
+                count = 0
+                used = 0
+                while (
+                    idx < num_items and
+                    count < manager.max_batch_size and
+                    used < manager.token_budgets[-1]
+                ):
+                    count += 1
+                    used += out_tokens[sorted_indices[idx]]
+                    indexes.append(sorted_indices[idx])
+
+                    idx += 1
+                
+                budget = get_fit_val(manager.token_budgets, used)
+                batches.append((budget, indexes))
+
+
+            def run_batch(
+                budget: int | None,
+                output_tokens: list[int],
+                mm_kwargs: dict[str, NestedTensors],
+            ) -> list[jax.Array]:
+                if budget is None: # Budget size not supported
+                    return embed_multimodal_func_torch(
+                        jax_params_and_buffers,
+                        **mm_kwargs,
+                    )
+                # Now, for normal cases.
+                jax_outputs = embed_multimodal_graph_forward(
+                    jax_params_and_buffers,
+                    mm_kwargs,
+                    budget,
+                )
+
+                with (
+                    torchax.default_env(),
+                     _timer("slicing"),
+                ):
+                    local_indexes = list(range(len(output_tokens)))
+
                     by_idx: dict[int, torch.Tensor] = {}
                     model.postprocess_encoder_output(
-                        outputs,
-                        list(range(len(item_specs))),
-                        [spec.output_tokens for spec in item_specs],
-                        by_idx, # output parameter
+                        torch_view(jax_outputs),
+                        local_indexes,
+                        output_tokens,
+                        dest=by_idx, # the output parameter
                         clone=True,
                         batch_mm_kwargs=mm_kwargs,
                     )
 
-                return jax_view([by_idx[i] for i in range(len(item_specs))])
+                return jax_view([by_idx[i] for i in local_indexes])
+
+            outputs: dict[int, jax.Array] = {}
+            for budget, indexes in batches:
+                batch_mm_kwargs = model.select_encoder_cudagraph_items(
+                    mm_kwargs,
+                    indexes,
+                )
+                batch_outputs = run_batch(
+                    budget,
+                    [out_tokens[i] for i in indexes],
+                    batch_mm_kwargs,
+                )
+                outputs |= {
+                    index: output
+                    for index, output in zip(indexes, batch_outputs)
+                }
+
+            return [outputs[i] for i in range(len(item_specs))]
 
 
         def embed_multimodal_func_jax(
@@ -761,7 +832,7 @@ class VllmModelWrapper:
             padding_logics = graph_config.padding_logics
 
         if self._use_graph_feature:
-            return embed_multimodal_graph_forward
+            return embed_multimodal_graph_forward_all
         else:
             return embed_multimodal_func_torch
 
