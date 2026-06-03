@@ -95,6 +95,87 @@ class _MetaModel(
     # in IDE like auto-complete and go-definition ... etc.
     # If we find some interface is good for developer experience, add it here.
 
+class EncoderManger:
+    """
+    The helper for multi-modal data processing.
+    
+    Responsible for most initialization task from vllm EncoderCudaGraphManager.
+    """
+    def __init__(
+            self,
+            vllm_config: VllmConfig,
+            model: SupportsEncoderCudaGraph,
+        ):
+
+        self.config = model.get_encoder_cudagraph_config()
+        self.dtype = vllm_config.model_config.dtype
+
+        comp_config = vllm_config.compilation_config
+        multimodal_config = vllm_config.model_config.multimodal_config
+        assert multimodal_config is not None
+
+        def build_budgets_and_batch() -> tuple[list[int], int]:
+            user_budgets = comp_config.encoder_cudagraph_token_budgets
+            user_max_vision_items = comp_config.encoder_cudagraph_max_vision_items_per_batch
+            min_budget, max_budget = model.get_encoder_cudagraph_budget_range(
+                vllm_config
+            )
+            assert min_budget > 0 and max_budget > 0
+            assert min_budget <= max_budget
+
+            if user_max_vision_items > 0:
+                # User provided max_vision_items only; adjust auto-inferred
+                # budgets so min(budgets) >= max_batch_size.
+                effective_min = max(min_budget, user_max_vision_items)
+                token_budgets = self._generate_budgets(effective_min, max_budget)
+                return token_budgets, user_max_vision_items
+            elif user_budgets:
+                # User provided budgets only; cap auto-inferred
+                # max_batch_size to min(user_budgets).
+                token_budgets = sorted(user_budgets)
+                max_batch_size = min(
+                    max_budget // min_budget,
+                    min(token_budgets),
+                )
+                return token_budgets, max_batch_size
+            else:
+                # Fully auto-inferred.
+                token_budgets = self._generate_budgets(min_budget, max_budget)
+                max_batch_size = min(
+                    max_budget // min_budget,
+                    min(token_budgets),
+                )
+                return token_budgets, max_batch_size
+
+        self.token_budgets, self.max_batch_size = build_budgets_and_batch()
+
+        def build_max_frames() -> int:
+            user_max_frames = comp_config.encoder_cudagraph_max_frames_per_batch
+
+            if multimodal_config.get_limit_per_prompt("video") == 0:
+                return 0
+            elif user_max_frames is not None:
+                return user_max_frames
+            else:
+                # Set it to the model-specific value from config.
+                return self.max_batch_size * self.config.max_frames_per_video
+            
+        self.max_frames_per_batch = build_max_frames()
+
+
+    @staticmethod
+    def _generate_budgets(min_budget: int, max_budget: int) -> list[int]:
+        """Generate power-of-2 token budgets from min_budget to max_budget."""
+        # Copied from EncoderCudaGraphManager directly.
+        budgets: list[int] = []
+        b = min_budget
+        while b <= max_budget:
+            budgets.append(b)
+            b *= 2
+        # Always include max_budget if it's not already a power-of-2 boundary
+        if not budgets or budgets[-1] < max_budget:
+            budgets.append(max_budget)
+        return budgets
 
 class VllmModelWrapper:
     """ Wraps a vLLM Pytorch model and let it run on the JAX engine. """
@@ -450,7 +531,7 @@ class VllmModelWrapper:
             jax_params_and_buffers: Mapping[str, jax.Array],
             **mm_kwargs: dict[str, NestedTensors],
         ) -> list[jax.Array] | jax.Array:
-            # See MultiModalEmbeddings from vllm lib for the meaning of return type.
+            # The return type is similar to MultiModalEmbeddings but in JAX.
             
             # Duplication of EncoderCudaGraphManager._copy_padded_buffer
             def copy_padded_buffer(
@@ -460,29 +541,43 @@ class VllmModelWrapper:
                 dst.zero_()
                 dst[: src.shape[0]].copy_(src)
 
-            # TODO: set value
-            TOKEN_BUDGET = 2048
-            MAX_BATCH_SIZE = 2
-            MAX_FRAME_PER_BATCH = 4
+            def get_fit_val(values: list[int], value: int) -> int | None:
+                # assume the values are ascending sorted.
+                for v in values:
+                    if v >= value:
+                        return v
+                return None
+
+            item_specs = self.model.get_encoder_cudagraph_item_specs(mm_kwargs)
+            token_budget = get_fit_val(
+                manager.token_budgets,
+                sum(spec.output_tokens for spec in item_specs),
+            )
+            if token_budget is None:
+                # Fallback to SupportsMultiModal.embed_multimodal
+                return embed_multimodal_func_torch(
+                    jax_params_and_buffers,
+                    **mm_kwargs,
+                )
+
             with (
                     torchax.default_env(),
                     enable_torch_wrap(False),
                     reparametrize(self.model, torch_view(jax_params_and_buffers)),
             ):
-                item_specs = self.model.get_encoder_cudagraph_item_specs(mm_kwargs)
 
                 values = self.model.prepare_encoder_cudagraph_replay_buffers(
                     mm_kwargs,
-                    MAX_BATCH_SIZE,
-                    MAX_FRAME_PER_BATCH,
+                    manager.max_batch_size,
+                    manager.max_frames_per_batch,
                 ).values
 
                 inputs = self.model.prepare_encoder_cudagraph_capture_inputs(
-                    TOKEN_BUDGET,
-                    MAX_BATCH_SIZE,
-                    MAX_FRAME_PER_BATCH,
+                    token_budget,
+                    manager.max_batch_size,
+                    manager.max_frames_per_batch,
                     device=torch.device("cpu"),
-                    dtype=torch.bfloat16,
+                    dtype=manager.dtype,
                 ).values
 
                 # We move tensors to TPU manually here. Since that some models
@@ -491,6 +586,7 @@ class VllmModelWrapper:
                 # Search max_seqlen in Qwen 3 VL for more details.
                 inputs = jax.tree.map(to_tpu, inputs)
 
+                # Move per-req states into fixed-sized tensor buffers.
                 for key in graph_config.buffer_keys:
                     src = values.get(key)
                     if src is None:
@@ -563,7 +659,8 @@ class VllmModelWrapper:
 
 
         if self._use_graph_feature:
-            graph_config = self.model.get_encoder_cudagraph_config()
+            manager = EncoderManger(self.vllm_config, self.model)
+            graph_config = manager.config
             padding_logics = graph_config.padding_logics
 
         if self._use_graph_feature:
