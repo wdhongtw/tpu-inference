@@ -42,7 +42,6 @@ from vllm.model_executor.models.interfaces import (SupportsEncoderCudaGraph,
 from vllm.model_executor.models.interfaces_base import (
     VllmModelForPooling, VllmModelForTextGeneration, is_pooling_model)
 from vllm.multimodal.inputs import NestedTensors
-from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.outputs import PoolerOutput
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import \
@@ -68,6 +67,7 @@ from tpu_inference.models.vllm.experimental.qwen3_vl_patcher import \
 from tpu_inference.models.vllm.experimental.vision_tower_jit import (
     maybe_jit_embed_multimodal_func, maybe_precompile_vision_encoder_fn,
     maybe_prepare_for_jit)
+from tpu_inference.models.vllm.mm_encoder_manager import MMEncoderManager
 from tpu_inference.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context, set_vllm_model_wrapper_context)
 from tpu_inference.runner.lora_utils import replace_lora_metadata
@@ -110,111 +110,6 @@ def _to_tpu(v: torch.Tensor) -> torch.Tensor | None:
         return None
 
     return torch_view(t2j(v, use_dlpack=False))
-
-
-class EncoderManager:
-    """
-    The helper for multi-modal data processing.
-    
-    Responsible for most initialization task from vllm EncoderCudaGraphManager.
-    """
-
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        model: SupportsEncoderCudaGraph,
-    ):
-
-        self.config = model.get_encoder_cudagraph_config()
-        self.dtype = vllm_config.model_config.dtype
-
-        comp_config = vllm_config.compilation_config
-        multimodal_config = vllm_config.model_config.multimodal_config
-        assert multimodal_config is not None
-
-        def build_budgets_and_batch() -> tuple[list[int], int]:
-            user_budgets = comp_config.encoder_cudagraph_token_budgets
-            user_max_vision_items = comp_config.encoder_cudagraph_max_vision_items_per_batch
-            min_budget, max_budget = model.get_encoder_cudagraph_budget_range(
-                vllm_config)
-            assert min_budget > 0 and max_budget > 0
-            assert min_budget <= max_budget
-
-            if user_max_vision_items > 0:
-                # User provided max_vision_items only; adjust auto-inferred
-                # budgets so min(budgets) >= max_batch_size.
-                effective_min = max(min_budget, user_max_vision_items)
-                token_budgets = self._generate_budgets(effective_min,
-                                                       max_budget)
-                return token_budgets, user_max_vision_items
-            elif user_budgets:
-                # User provided budgets only; cap auto-inferred
-                # max_batch_size to min(user_budgets).
-                token_budgets = sorted(user_budgets)
-                max_batch_size = min(
-                    max_budget // min_budget,
-                    min(token_budgets),
-                )
-                return token_budgets, max_batch_size
-            else:
-                # Fully auto-inferred.
-                token_budgets = self._generate_budgets(min_budget, max_budget)
-                max_batch_size = min(
-                    max_budget // min_budget,
-                    min(token_budgets),
-                )
-                return token_budgets, max_batch_size
-
-        token_budgets, max_batch_size = build_budgets_and_batch()
-        self.token_budgets = token_budgets
-        """Sorted (ascending) list of token budgets."""
-        self.max_batch_size = max_batch_size
-
-        def build_max_frames() -> int:
-            user_max_frames = comp_config.encoder_cudagraph_max_frames_per_batch
-
-            if multimodal_config.get_limit_per_prompt("video") == 0:
-                return 0
-            elif user_max_frames is not None:
-                return user_max_frames
-            else:
-                # Set it to the model-specific value from config.
-                return self.max_batch_size * self.config.max_frames_per_video
-
-        self.max_frames_per_batch = build_max_frames()
-
-        def build_inputs(token_budget: int) -> dict[str, torch.Tensor]:
-
-            # Temporary overriding this value here can help mitigate an
-            # assertion error in OpenMP (libgomp) shipped with PyTorch (2.10).
-            # that breaks for budget 512 for model Qwen/Qwen3-VL-2B-Thinking.
-            with set_default_torch_num_threads(None):
-                inputs = model.prepare_encoder_cudagraph_capture_inputs(
-                    token_budget,
-                    self.max_batch_size,
-                    self.max_frames_per_batch,
-                    device=torch.device("cpu"),
-                    dtype=self.dtype,
-                ).values
-
-            return inputs
-
-        self.by_budget = {b: build_inputs(b) for b in self.token_budgets}
-        """The "input tensors" for each token budget."""
-
-    @staticmethod
-    def _generate_budgets(min_budget: int, max_budget: int) -> list[int]:
-        """Generate power-of-2 token budgets from min_budget to max_budget."""
-        # Copied from EncoderCudaGraphManager directly.
-        budgets: list[int] = []
-        b = min_budget
-        while b <= max_budget:
-            budgets.append(b)
-            b *= 2
-        # Always include max_budget if it's not already a power-of-2 boundary
-        if not budgets or budgets[-1] < max_budget:
-            budgets.append(max_budget)
-        return budgets
 
 
 class VllmModelWrapper:
@@ -387,7 +282,7 @@ class VllmModelWrapper:
             return results
 
         if self._use_graph_feature:
-            self._encoder_manager = EncoderManager(
+            self._encoder_manager = MMEncoderManager(
                 self.vllm_config,
                 self.model,
             )
